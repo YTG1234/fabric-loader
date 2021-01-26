@@ -16,14 +16,56 @@
 
 package net.fabricmc.loader.discovery;
 
+import java.io.BufferedWriter;
+import java.io.File;
+import java.io.FileNotFoundException;
+import java.io.FileWriter;
+import java.io.IOException;
+import java.io.InputStreamReader;
+import java.net.MalformedURLException;
+import java.net.URL;
+import java.nio.charset.Charset;
+import java.nio.charset.StandardCharsets;
+import java.nio.file.FileSystem;
+import java.nio.file.Files;
+import java.nio.file.NoSuchFileException;
+import java.nio.file.Path;
+import java.util.ArrayList;
+import java.util.Collection;
+import java.util.Collections;
+import java.util.HashMap;
+import java.util.HashSet;
+import java.util.List;
+import java.util.Map;
+import java.util.Queue;
+import java.util.Set;
+import java.util.UUID;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ConcurrentLinkedQueue;
+import java.util.concurrent.ConcurrentMap;
+import java.util.concurrent.ForkJoinPool;
+import java.util.concurrent.RecursiveAction;
+import java.util.concurrent.TimeUnit;
+import java.util.regex.Pattern;
+import java.util.stream.Collectors;
+import java.util.stream.IntStream;
+import java.util.zip.ZipError;
+
 import com.google.common.jimfs.Configuration;
 import com.google.common.jimfs.Jimfs;
 import com.google.common.jimfs.PathType;
+import io.github.ytg1234.fabricmodkts.ext.SpecExtsKt;
+import io.github.ytg1234.fabricmodkts.script.ModMetadataScriptHost;
+import io.github.ytg1234.fabricmodkts.spec.FabricModMetadata;
+import kotlin.script.experimental.host.FileScriptSource;
+import kotlin.script.experimental.host.StringScriptSource;
+import org.apache.logging.log4j.Logger;
+import static com.google.common.jimfs.Feature.*;
 
 import net.fabricmc.loader.FabricLoader;
+import net.fabricmc.loader.api.Version;
 import net.fabricmc.loader.api.metadata.ModDependency;
 import net.fabricmc.loader.game.GameProvider.BuiltinMod;
-import net.fabricmc.loader.api.Version;
 import net.fabricmc.loader.launch.common.FabricLauncherBase;
 import net.fabricmc.loader.lib.gson.MalformedJsonException;
 import net.fabricmc.loader.metadata.BuiltinModMetadata;
@@ -42,36 +84,15 @@ import net.fabricmc.loader.util.sat4j.specs.ISolver;
 import net.fabricmc.loader.util.sat4j.specs.IVecInt;
 import net.fabricmc.loader.util.sat4j.specs.TimeoutException;
 
-import org.apache.logging.log4j.Logger;
-
-import java.io.File;
-import java.io.IOException;
-import java.net.MalformedURLException;
-import java.net.URL;
-import java.nio.file.FileSystem;
-import java.nio.file.Files;
-import java.nio.file.NoSuchFileException;
-import java.nio.file.Path;
-import java.util.*;
-import java.util.concurrent.*;
-import java.util.regex.Pattern;
-import java.util.stream.Collectors;
-import java.util.stream.IntStream;
-import java.util.zip.ZipError;
-
-import static com.google.common.jimfs.Feature.FILE_CHANNEL;
-import static com.google.common.jimfs.Feature.SECURE_DIRECTORY_STREAM;
-
 public class ModResolver {
 	// nested JAR store
-	private static final FileSystem inMemoryFs = Jimfs.newFileSystem(
-		"nestedJarStore",
-		Configuration.builder(PathType.unix())
-			.setRoots("/")
-			.setWorkingDirectory("/")
-			.setAttributeViews("basic")
-			.setSupportedFeatures(SECURE_DIRECTORY_STREAM, FILE_CHANNEL)
-			.build()
+	private static final FileSystem inMemoryFs = Jimfs.newFileSystem("nestedJarStore",
+			Configuration.builder(PathType.unix())
+						 .setRoots("/")
+						 .setWorkingDirectory("/")
+						 .setAttributeViews("basic")
+						 .setSupportedFeatures(SECURE_DIRECTORY_STREAM, FILE_CHANNEL)
+						 .build()
 	);
 	private static final Map<String, List<Path>> inMemoryCache = new ConcurrentHashMap<>();
 	private static final Pattern MOD_ID_PATTERN = Pattern.compile("[a-z][a-z0-9-_]{1,63}");
@@ -82,12 +103,102 @@ public class ModResolver {
 	public ModResolver() {
 	}
 
+	public static FileSystem getInMemoryFs() {
+		return inMemoryFs;
+	}
+
 	public void addCandidateFinder(ModCandidateFinder f) {
 		candidateFinders.add(f);
 	}
 
-	private static IVecInt toVecInt(IntStream stream) {
-		return new VecInt(stream.toArray());
+	public Map<String, ModCandidate> resolve(FabricLoader loader) throws ModResolutionException {
+		ConcurrentMap<String, ModCandidateSet> candidatesById = new ConcurrentHashMap<>();
+
+		long time1 = System.currentTimeMillis();
+		Queue<UrlProcessAction> allActions = new ConcurrentLinkedQueue<>();
+		ForkJoinPool pool = new ForkJoinPool(Math.max(1, Runtime.getRuntime().availableProcessors() - 1));
+		for (ModCandidateFinder f : candidateFinders) {
+			f.findCandidates(loader, (u, requiresRemap) -> {
+				UrlProcessAction action = new UrlProcessAction(loader, candidatesById, u, 0, requiresRemap);
+				allActions.add(action);
+				pool.execute(action);
+			});
+		}
+
+		// add builtin mods
+		for (BuiltinMod mod : loader.getGameProvider().getBuiltinMods()) {
+			addBuiltinMod(candidatesById, mod);
+		}
+
+		// Add the current Java version
+		try {
+			addBuiltinMod(candidatesById, new BuiltinMod(new File(System.getProperty("java.home")).toURI().toURL(),
+					new BuiltinModMetadata.Builder(
+							"java",
+							System.getProperty("java.specification.version").replaceFirst("^1\\.", "")
+					).setName(System.getProperty("java.vm.name")).build()
+			));
+		} catch (MalformedURLException e) {
+			throw new ModResolutionException("Could not add Java to the dependency constraints", e);
+		}
+
+		boolean tookTooLong = false;
+		Throwable exception = null;
+		try {
+			pool.shutdown();
+			// Comment out for debugging
+			pool.awaitTermination(30, TimeUnit.SECONDS);
+			for (UrlProcessAction action : allActions) {
+				if (!action.isDone()) {
+					tookTooLong = true;
+				} else {
+					Throwable t = action.getException();
+					if (t != null) {
+						if (exception == null) {
+							exception = t;
+						} else {
+							exception.addSuppressed(t);
+						}
+					}
+				}
+			}
+		} catch (InterruptedException e) {
+			throw new ModResolutionException("Mod resolution took too long!", e);
+		}
+		if (tookTooLong) {
+			throw new ModResolutionException("Mod resolution took too long!");
+		}
+		if (exception != null) {
+			throw new ModResolutionException("Mod resolution failed!", exception);
+		}
+
+		long time2 = System.currentTimeMillis();
+		Map<String, ModCandidate> result = findCompatibleSet(loader.getLogger(), candidatesById);
+
+		long time3 = System.currentTimeMillis();
+		loader.getLogger().debug("Mod resolution detection time: " + (time2 - time1) + "ms");
+		loader.getLogger().debug("Mod resolution time: " + (time3 - time2) + "ms");
+
+		for (ModCandidate candidate : result.values()) {
+			if (candidate.getInfo().getSchemaVersion() < ModMetadataParser.LATEST_VERSION) {
+				loader.getLogger()
+					  .warn("Mod ID " +
+							candidate.getInfo().getId() +
+							" uses outdated schema version: " +
+							candidate.getInfo().getSchemaVersion() +
+							" < " +
+							ModMetadataParser.LATEST_VERSION);
+			}
+
+			candidate.getInfo().emitFormatWarnings(loader.getLogger());
+		}
+
+		return result;
+	}
+
+	private void addBuiltinMod(ConcurrentMap<String, ModCandidateSet> candidatesById, BuiltinMod mod) {
+		candidatesById.computeIfAbsent(mod.metadata.getId(), ModCandidateSet::new)
+					  .add(new ModCandidate(new BuiltinMetadataWrapper(mod.metadata), mod.url, 0, false));
 	}
 
 	// TODO: Find a way to sort versions of mods by suggestions and conflicts (not crucial, though)
@@ -117,7 +228,7 @@ public class ModResolver {
 			for (String s : modCandidateMap.keySet()) {
 				ModCandidate candidate = modCandidateMap.get(s).iterator().next();
 				// if the candidate isn't actually just a provided alias, then put it on
-				if(!candidate.getInfo().getProvides().contains(s)) result.put(s, candidate);
+				if (!candidate.getInfo().getProvides().contains(s)) result.put(s, candidate);
 			}
 		} else {
 			// Inspired by http://0install.net/solver.html
@@ -164,10 +275,10 @@ public class ModResolver {
 
 					for (ModDependency dep : mod.getInfo().getDepends()) {
 						int[] matchingCandidates = modCandidateMap.getOrDefault(dep.getModId(), Collections.emptyList())
-							.stream()
-							.filter((c) -> dep.matches(c.getInfo().getVersion()))
-							.mapToInt(candidateIntMap::get)
-							.toArray();
+																  .stream()
+																  .filter((c) -> dep.matches(c.getInfo().getVersion()))
+																  .mapToInt(candidateIntMap::get)
+																  .toArray();
 
 						int[] clause = new int[matchingCandidates.length + 1];
 						System.arraycopy(matchingCandidates, 0, clause, 0, matchingCandidates.length);
@@ -188,14 +299,14 @@ public class ModResolver {
 
 					for (ModDependency dep : mod.getInfo().getBreaks()) {
 						int[] matchingCandidates = modCandidateMap.getOrDefault(dep.getModId(), Collections.emptyList())
-							.stream()
-							.filter((c) -> dep.matches(c.getInfo().getVersion()))
-							.mapToInt(candidateIntMap::get)
-							.toArray();
+																  .stream()
+																  .filter((c) -> dep.matches(c.getInfo().getVersion()))
+																  .mapToInt(candidateIntMap::get)
+																  .toArray();
 
 						try {
 							for (int m : matchingCandidates) {
-								solver.addClause(new VecInt(new int[] { -modClauseId, -m }));
+								solver.addClause(new VecInt(new int[] {-modClauseId, -m}));
 							}
 						} catch (ContradictionException e) {
 							throw new ModResolutionException("Found conflicting mods: " + mod.getInfo().getId() + " conflicts with " + dep, e);
@@ -301,11 +412,11 @@ public class ModResolver {
 
 				if (!suspiciousVersions.isEmpty()) {
 					errorsSoft.append("\n - Conflicting versions found for ")
-						.append(candidate.getInfo().getId())
-						.append(": used ")
-						.append(version.getFriendlyString())
-						.append(", also found ")
-						.append(suspiciousVersions.stream().map(Version::getFriendlyString).collect(Collectors.joining(", ")));
+							  .append(candidate.getInfo().getId())
+							  .append(": used ")
+							  .append(version.getFriendlyString())
+							  .append(", also found ")
+							  .append(suspiciousVersions.stream().map(Version::getFriendlyString).collect(Collectors.joining(", ")));
 				}
 			}
 		}
@@ -325,14 +436,31 @@ public class ModResolver {
 		return result;
 	}
 
-	private void addErrorToList(Logger logger, ModCandidate candidate, ModDependency dependency, Map<String, ModCandidate> result, StringBuilder errors, String errorType, boolean cond) {
+	private static IVecInt toVecInt(IntStream stream) {
+		return new VecInt(stream.toArray());
+	}
+
+	private void addErrorToList(
+			Logger logger,
+			ModCandidate candidate,
+			ModDependency dependency,
+			Map<String, ModCandidate> result,
+			StringBuilder errors,
+			String errorType,
+			boolean cond
+	) {
 		String depModId = dependency.getModId();
 
 		List<String> errorList = new ArrayList<>();
 
 		if (!isModIdValid(depModId, errorList)) {
-			errors.append("\n - Mod ").append(getCandidateName(candidate)).append(" ").append(errorType).append(" ")
-					.append(depModId).append(", which has an invalid mod ID because:");
+			errors.append("\n - Mod ")
+				  .append(getCandidateName(candidate))
+				  .append(" ")
+				  .append(errorType)
+				  .append(" ")
+				  .append(depModId)
+				  .append(", which has an invalid mod ID because:");
 
 			for (String error : errorList) {
 				errors.append("\n\t - It ").append(error);
@@ -343,10 +471,18 @@ public class ModResolver {
 
 		ModCandidate depCandidate = result.get(depModId);
 		// attempt searching provides
-		if(depCandidate == null) {
+		if (depCandidate == null) {
 			for (ModCandidate value : result.values()) {
 				if (value.getInfo().getProvides().contains(depModId)) {
-					if(FabricLoader.INSTANCE.isDevelopmentEnvironment()) logger.warn("Mod " + candidate.getInfo().getId() + " is using the provided alias " + depModId + " in place of the real mod id " + value.getInfo().getId() + ".  Please use the mod id instead of a provided alias.");
+					if (FabricLoader.INSTANCE.isDevelopmentEnvironment()) {
+						logger.warn("Mod " +
+									candidate.getInfo().getId() +
+									" is using the provided alias " +
+									depModId +
+									" in place of the real mod id " +
+									value.getInfo().getId() +
+									".  Please use the mod id instead of a provided alias.");
+					}
 					depCandidate = value;
 					break;
 				}
@@ -355,9 +491,15 @@ public class ModResolver {
 		boolean isPresent = depCandidate != null && dependency.matches(depCandidate.getInfo().getVersion());
 
 		if (isPresent != cond) {
-			errors.append("\n - Mod ").append(getCandidateName(candidate)).append(" ").append(errorType).append(" ")
-					.append(getDependencyVersionRequirements(dependency)).append(" of mod ")
-					.append(depCandidate == null ? depModId : getCandidateName(depCandidate)).append(", ");
+			errors.append("\n - Mod ")
+				  .append(getCandidateName(candidate))
+				  .append(" ")
+				  .append(errorType)
+				  .append(" ")
+				  .append(getDependencyVersionRequirements(dependency))
+				  .append(" of mod ")
+				  .append(depCandidate == null ? depModId : getCandidateName(depCandidate))
+				  .append(", ");
 			if (depCandidate == null) {
 				appendMissingDependencyError(errors, dependency);
 			} else if (cond) {
@@ -374,137 +516,9 @@ public class ModResolver {
 		}
 	}
 
-	private void appendMissingDependencyError(StringBuilder errors, ModDependency dependency) {
-		errors.append("which is missing!");
-		errors.append("\n\t - You must install ").append(getDependencyVersionRequirements(dependency)).append(" of ")
-				.append(dependency.getModId()).append(".");
-	}
-
-	private void appendUnsatisfiedDependencyError(StringBuilder errors, ModDependency dependency, ModCandidate depCandidate) {
-		errors.append("but a non-matching version is present: ").append(getCandidateFriendlyVersion(depCandidate)).append("!");
-		errors.append("\n\t - You must install ").append(getDependencyVersionRequirements(dependency)).append(" of ")
-				.append(getCandidateName(depCandidate)).append(".");
-	}
-
-	private void appendConflictError(StringBuilder errors, ModCandidate candidate, ModCandidate depCandidate) {
-		final String depCandidateVer = getCandidateFriendlyVersion(depCandidate);
-		errors.append("but a matching version is present: ").append(depCandidateVer).append("!");
-		errors.append("\n\t - While this won't prevent you from starting the game,");
-		errors.append(" the developer(s) of ").append(getCandidateName(candidate));
-		errors.append(" have found that version ").append(depCandidateVer).append(" of ").append(getCandidateName(depCandidate));
-		errors.append(" conflicts with their mod.");
-		errors.append("\n\t - It is heavily recommended to remove one of the mods.");
-	}
-
-	private void appendBreakingError(StringBuilder errors, ModCandidate candidate, ModCandidate depCandidate) {
-		final String depCandidateVer = getCandidateFriendlyVersion(depCandidate);
-		errors.append("but a matching version is present: ").append(depCandidate.getInfo().getVersion()).append("!");
-		errors.append("\n\t - The developer(s) of ").append(getCandidateName(candidate));
-		errors.append(" have found that version ").append(depCandidateVer).append(" of ").append(getCandidateName(depCandidate));
-		errors.append(" critically conflicts with their mod.");
-		errors.append("\n\t - You must remove one of the mods.");
-	}
-
-	private void appendJiJInfo(StringBuilder errors, Map<String, ModCandidate> result, ModCandidate candidate) {
-		if (candidate.getDepth() < 1) {
-			errors.append("\n\t - Mod ").append(getCandidateName(candidate))
-					.append(" v").append(getCandidateFriendlyVersion(candidate))
-					.append(" is being loaded from the user's mod directory.");
-			return;
-		}
-		URL originUrl = candidate.getOriginUrl();
-		// step 1: try to find source mod's URL
-		URL sourceUrl = null;
-		try {
-			for (Map.Entry<String, List<Path>> entry : inMemoryCache.entrySet()) {
-				for (Path path : entry.getValue()) {
-					URL url = UrlUtil.asUrl(path.normalize());
-					if (originUrl.equals(url)) {
-						sourceUrl = new URL(entry.getKey());
-						break;
-					}
-				}
-			}
-		} catch (UrlConversionException | MalformedURLException e) {
-			e.printStackTrace();
-		}
-		if (sourceUrl == null) {
-			errors.append("\n\t - Mod ").append(getCandidateName(candidate))
-					.append(" v").append(getCandidateFriendlyVersion(candidate))
-					.append(" is being provided by <unknown mod>.");
-			return;
-		}
-		// step 2: try to find source mod candidate
-		ModCandidate srcCandidate = null;
-		for (Map.Entry<String, ModCandidate> entry : result.entrySet()) {
-			if (sourceUrl.equals(entry.getValue().getOriginUrl())) {
-				srcCandidate = entry.getValue();
-				break;
-			}
-		}
-		if (srcCandidate == null) {
-			errors.append("\n\t - Mod ").append(getCandidateName(candidate))
-					.append(" v").append(getCandidateFriendlyVersion(candidate))
-					.append(" is being provided by <unknown mod: ")
-					.append(sourceUrl).append(">.");
-			return;
-		}
-		// now we have the proper data, yay
-		errors.append("\n\t - Mod ").append(getCandidateName(candidate))
-				.append(" v").append(getCandidateFriendlyVersion(candidate))
-				.append(" is being provided by ").append(getCandidateName(srcCandidate))
-				.append(" v").append(getCandidateFriendlyVersion(candidate))
-				.append('.');
-	}
-
-	private static String getCandidateName(ModCandidate candidate) {
-		return "'" + candidate.getInfo().getName() + "' (" + candidate.getInfo().getId() + ")";
-	}
-
-	private static String getCandidateFriendlyVersion(ModCandidate candidate) {
-		return candidate.getInfo().getVersion().getFriendlyString();
-	}
-
-	private static String getDependencyVersionRequirements(ModDependency dependency) {
-		return dependency.getVersionRequirements().stream().map(predicate -> {
-			String version = predicate.getVersion();
-			String[] parts;
-			switch(predicate.getType()) {
-			case ANY:
-				return "any version";
-			case EQUALS:
-				return "version " + version;
-			case GREATER_THAN:
-				return "any version after " + version;
-			case LESSER_THAN:
-				return "any version before " + version;
-			case GREATER_THAN_OR_EQUAL:
-				return "version " + version + " or later";
-			case LESSER_THAN_OR_EQUAL:
-				return "version " + version + " or earlier";
-			case SAME_MAJOR:
-				parts = version.split("\\.");
-
-				for (int i = 1; i < parts.length; i++) {
-					parts[i] = "x";
-				}
-
-				return "version " + String.join(".", parts);
-			case SAME_MAJOR_AND_MINOR:
-				parts = version.split("\\.");
-
-				for (int i = 2; i < parts.length; i++) {
-					parts[i] = "x";
-				}
-
-				return "version " + String.join(".", parts);
-			default:
-				return "unknown version"; // should be unreachable
-			}
-		}).collect(Collectors.joining(" or "));
-	}
-
-	/** @param errorList The list of errors. The returned list of errors all need to be prefixed with "it " in order to make sense. */
+	/**
+	 * @param errorList The list of errors. The returned list of errors all need to be prefixed with "it " in order to make sense.
+	 */
 	private static boolean isModIdValid(String modId, List<String> errorList) {
 		// A more useful error list for MOD_ID_PATTERN
 		if (modId.isEmpty()) {
@@ -521,7 +535,9 @@ public class ModResolver {
 		char first = modId.charAt(0);
 
 		if (first < 'a' || first > 'z') {
-			errorList.add("starts with an invalid character '" + first + "' (it must be a lowercase a-z - uppercase isn't allowed anywhere in the ID)");
+			errorList.add("starts with an invalid character '" +
+						  first +
+						  "' (it must be a lowercase a-z - uppercase isn't allowed anywhere in the ID)");
 		}
 
 		Set<Character> invalidChars = null;
@@ -550,6 +566,153 @@ public class ModResolver {
 		return errorList.isEmpty();
 	}
 
+	private static String getCandidateName(ModCandidate candidate) {
+		return "'" + candidate.getInfo().getName() + "' (" + candidate.getInfo().getId() + ")";
+	}
+
+	private static String getDependencyVersionRequirements(ModDependency dependency) {
+		return dependency.getVersionRequirements().stream().map(predicate -> {
+			String version = predicate.getVersion();
+			String[] parts;
+			switch (predicate.getType()) {
+				case ANY:
+					return "any version";
+				case EQUALS:
+					return "version " + version;
+				case GREATER_THAN:
+					return "any version after " + version;
+				case LESSER_THAN:
+					return "any version before " + version;
+				case GREATER_THAN_OR_EQUAL:
+					return "version " + version + " or later";
+				case LESSER_THAN_OR_EQUAL:
+					return "version " + version + " or earlier";
+				case SAME_MAJOR:
+					parts = version.split("\\.");
+
+					for (int i = 1; i < parts.length; i++) {
+						parts[i] = "x";
+					}
+
+					return "version " + String.join(".", parts);
+				case SAME_MAJOR_AND_MINOR:
+					parts = version.split("\\.");
+
+					for (int i = 2; i < parts.length; i++) {
+						parts[i] = "x";
+					}
+
+					return "version " + String.join(".", parts);
+				default:
+					return "unknown version"; // should be unreachable
+			}
+		}).collect(Collectors.joining(" or "));
+	}
+
+	private void appendMissingDependencyError(StringBuilder errors, ModDependency dependency) {
+		errors.append("which is missing!");
+		errors.append("\n\t - You must install ")
+			  .append(getDependencyVersionRequirements(dependency))
+			  .append(" of ")
+			  .append(dependency.getModId())
+			  .append(".");
+	}
+
+	private void appendUnsatisfiedDependencyError(StringBuilder errors, ModDependency dependency, ModCandidate depCandidate) {
+		errors.append("but a non-matching version is present: ").append(getCandidateFriendlyVersion(depCandidate)).append("!");
+		errors.append("\n\t - You must install ")
+			  .append(getDependencyVersionRequirements(dependency))
+			  .append(" of ")
+			  .append(getCandidateName(depCandidate))
+			  .append(".");
+	}
+
+	private void appendConflictError(StringBuilder errors, ModCandidate candidate, ModCandidate depCandidate) {
+		final String depCandidateVer = getCandidateFriendlyVersion(depCandidate);
+		errors.append("but a matching version is present: ").append(depCandidateVer).append("!");
+		errors.append("\n\t - While this won't prevent you from starting the game,");
+		errors.append(" the developer(s) of ").append(getCandidateName(candidate));
+		errors.append(" have found that version ").append(depCandidateVer).append(" of ").append(getCandidateName(depCandidate));
+		errors.append(" conflicts with their mod.");
+		errors.append("\n\t - It is heavily recommended to remove one of the mods.");
+	}
+
+	private void appendBreakingError(StringBuilder errors, ModCandidate candidate, ModCandidate depCandidate) {
+		final String depCandidateVer = getCandidateFriendlyVersion(depCandidate);
+		errors.append("but a matching version is present: ").append(depCandidate.getInfo().getVersion()).append("!");
+		errors.append("\n\t - The developer(s) of ").append(getCandidateName(candidate));
+		errors.append(" have found that version ").append(depCandidateVer).append(" of ").append(getCandidateName(depCandidate));
+		errors.append(" critically conflicts with their mod.");
+		errors.append("\n\t - You must remove one of the mods.");
+	}
+
+	private void appendJiJInfo(StringBuilder errors, Map<String, ModCandidate> result, ModCandidate candidate) {
+		if (candidate.getDepth() < 1) {
+			errors.append("\n\t - Mod ")
+				  .append(getCandidateName(candidate))
+				  .append(" v")
+				  .append(getCandidateFriendlyVersion(candidate))
+				  .append(" is being loaded from the user's mod directory.");
+			return;
+		}
+		URL originUrl = candidate.getOriginUrl();
+		// step 1: try to find source mod's URL
+		URL sourceUrl = null;
+		try {
+			for (Map.Entry<String, List<Path>> entry : inMemoryCache.entrySet()) {
+				for (Path path : entry.getValue()) {
+					URL url = UrlUtil.asUrl(path.normalize());
+					if (originUrl.equals(url)) {
+						sourceUrl = new URL(entry.getKey());
+						break;
+					}
+				}
+			}
+		} catch (UrlConversionException | MalformedURLException e) {
+			e.printStackTrace();
+		}
+		if (sourceUrl == null) {
+			errors.append("\n\t - Mod ")
+				  .append(getCandidateName(candidate))
+				  .append(" v")
+				  .append(getCandidateFriendlyVersion(candidate))
+				  .append(" is being provided by <unknown mod>.");
+			return;
+		}
+		// step 2: try to find source mod candidate
+		ModCandidate srcCandidate = null;
+		for (Map.Entry<String, ModCandidate> entry : result.entrySet()) {
+			if (sourceUrl.equals(entry.getValue().getOriginUrl())) {
+				srcCandidate = entry.getValue();
+				break;
+			}
+		}
+		if (srcCandidate == null) {
+			errors.append("\n\t - Mod ")
+				  .append(getCandidateName(candidate))
+				  .append(" v")
+				  .append(getCandidateFriendlyVersion(candidate))
+				  .append(" is being provided by <unknown mod: ")
+				  .append(sourceUrl)
+				  .append(">.");
+			return;
+		}
+		// now we have the proper data, yay
+		errors.append("\n\t - Mod ")
+			  .append(getCandidateName(candidate))
+			  .append(" v")
+			  .append(getCandidateFriendlyVersion(candidate))
+			  .append(" is being provided by ")
+			  .append(getCandidateName(srcCandidate))
+			  .append(" v")
+			  .append(getCandidateFriendlyVersion(candidate))
+			  .append('.');
+	}
+
+	private static String getCandidateFriendlyVersion(ModCandidate candidate) {
+		return candidate.getInfo().getVersion().getFriendlyString();
+	}
+
 	static class UrlProcessAction extends RecursiveAction {
 		private final FabricLoader loader;
 		private final Map<String, ModCandidateSet> candidatesById;
@@ -563,6 +726,41 @@ public class ModResolver {
 			this.url = url;
 			this.depth = depth;
 			this.requiresRemap = requiresRemap;
+		}
+
+		private Path writeToTmp(Path kts, Path original) {
+			StringBuilder input = new StringBuilder();
+			try (InputStreamReader reader = new InputStreamReader(Files.newInputStream(kts), StandardCharsets.UTF_8)) {
+				int data;
+				while ((data = reader.read()) != -1) {
+					input.append((char) data);
+				}
+			} catch (IOException e) {
+				return original;
+			}
+
+			ModMetadataScriptHost host = new ModMetadataScriptHost();
+			FabricModMetadata meta = host.getNew(new StringScriptSource(input.toString(), "fabric.mod.kts"));
+
+			Path tmpModJson = net.fabricmc.loader.api.FabricLoader.getInstance()
+																  .getGameDir()
+																  .resolve(".fabric")
+																  .resolve("tmp")
+																  .resolve("fabric.mod.json");
+			if (Files.exists(tmpModJson)) tmpModJson.toFile().delete();
+
+			try {
+				if (tmpModJson.toFile().createNewFile()) {
+					try (BufferedWriter writer = new BufferedWriter(new FileWriter(tmpModJson.toFile()))) {
+						writer.write(SpecExtsKt.toJsonString(meta));
+						return tmpModJson;
+					}
+				}
+			} catch (IOException e) {
+				throw new RuntimeException("Unable to create file", e);
+			}
+
+			return original;
 		}
 
 		@Override
@@ -584,10 +782,19 @@ public class ModResolver {
 			if (Files.isDirectory(path)) {
 				// Directory
 				modJson = path.resolve("fabric.mod.json");
+
+				Path kts = path.resolve("fabric.mod.kts");
+				if (Files.exists(kts)) {
+					modJson = writeToTmp(kts, modJson);
+				}
+
 				rootDir = path;
 
 				if (loader.isDevelopmentEnvironment() && !Files.exists(modJson)) {
-					loader.getLogger().warn("Adding directory " + path + " to mod classpath in development environment - workaround for Gradle splitting mods into two directories");
+					loader.getLogger()
+						  .warn("Adding directory " +
+								path +
+								" to mod classpath in development environment - workaround for Gradle splitting mods into two directories");
 					synchronized (launcherSyncObject) {
 						FabricLauncherBase.getLauncher().propose(url);
 					}
@@ -597,6 +804,10 @@ public class ModResolver {
 				try {
 					jarFs = FileSystemUtil.getJarFileSystem(path, false);
 					modJson = jarFs.get().getPath("fabric.mod.json");
+
+					Path kts = jarFs.get().getPath("fabric.mod.kts");
+					modJson = writeToTmp(kts, modJson);
+
 					rootDir = jarFs.get().getRootDirectories().iterator().next();
 				} catch (IOException e) {
 					throw new RuntimeException("Failed to open mod JAR at " + path + "!");
@@ -608,9 +819,12 @@ public class ModResolver {
 			LoaderModMetadata[] info;
 
 			try {
-				info = new LoaderModMetadata[] { ModMetadataParser.parseMetadata(loader.getLogger(), modJson) };
-			} catch (ParseMetadataException.MissingRequired e){
-				throw new RuntimeException(String.format("Mod at \"%s\" has an invalid fabric.mod.json file! The mod is missing the following required field!", path), e);
+				info = new LoaderModMetadata[] {ModMetadataParser.parseMetadata(loader.getLogger(), modJson)};
+			} catch (ParseMetadataException.MissingRequired e) {
+				throw new RuntimeException(String.format(
+						"Mod at \"%s\" has an invalid fabric.mod.json file! The mod is missing the following required field!",
+						path
+				), e);
 			} catch (MalformedJsonException | ParseMetadataException e) {
 				throw new RuntimeException(String.format("Mod at \"%s\" has an invalid fabric.mod.json file!", path), e);
 			} catch (NoSuchFileException e) {
@@ -648,7 +862,7 @@ public class ModResolver {
 					throw new RuntimeException(fullError.toString());
 				}
 
-				for(String provides : candidate.getInfo().getProvides()) {
+				for (String provides : candidate.getInfo().getProvides()) {
 					if (!MOD_ID_PATTERN.matcher(provides).matches()) {
 						List<String> errorList = new ArrayList<>();
 						isModIdValid(provides, errorList);
@@ -703,16 +917,13 @@ public class ModResolver {
 					});
 
 					if (!jarInJars.isEmpty()) {
-						invokeAll(
-							jarInJars.stream()
-								.map((p) -> {
-									try {
-										return new UrlProcessAction(loader, candidatesById, UrlUtil.asUrl(p.normalize()), depth + 1, requiresRemap);
-									} catch (UrlConversionException e) {
-										throw new RuntimeException("Failed to turn path '" + p.normalize() + "' into URL!", e);
-									}
-								}).collect(Collectors.toList())
-						);
+						invokeAll(jarInJars.stream().map((p) -> {
+							try {
+								return new UrlProcessAction(loader, candidatesById, UrlUtil.asUrl(p.normalize()), depth + 1, requiresRemap);
+							} catch (UrlConversionException e) {
+								throw new RuntimeException("Failed to turn path '" + p.normalize() + "' into URL!", e);
+							}
+						}).collect(Collectors.toList()));
 					}
 				}
 			}
@@ -721,92 +932,5 @@ public class ModResolver {
 				jarFs.close();
 			} */
 		}
-	}
-
-	public Map<String, ModCandidate> resolve(FabricLoader loader) throws ModResolutionException {
-		ConcurrentMap<String, ModCandidateSet> candidatesById = new ConcurrentHashMap<>();
-
-		long time1 = System.currentTimeMillis();
-		Queue<UrlProcessAction> allActions = new ConcurrentLinkedQueue<>();
-		ForkJoinPool pool = new ForkJoinPool(Math.max(1, Runtime.getRuntime().availableProcessors() - 1));
-		for (ModCandidateFinder f : candidateFinders) {
-			f.findCandidates(loader, (u, requiresRemap) -> {
-				UrlProcessAction action = new UrlProcessAction(loader, candidatesById, u, 0, requiresRemap);
-				allActions.add(action);
-				pool.execute(action);
-			});
-		}
-
-		// add builtin mods
-		for (BuiltinMod mod : loader.getGameProvider().getBuiltinMods()) {
-			addBuiltinMod(candidatesById, mod);
-		}
-
-		// Add the current Java version
-		try {
-			addBuiltinMod(candidatesById, new BuiltinMod(
-					new File(System.getProperty("java.home")).toURI().toURL(),
-					new BuiltinModMetadata.Builder("java", System.getProperty("java.specification.version").replaceFirst("^1\\.", ""))
-						.setName(System.getProperty("java.vm.name"))
-						.build()));
-		} catch (MalformedURLException e) {
-			throw new ModResolutionException("Could not add Java to the dependency constraints", e);
-		}
-
-		boolean tookTooLong = false;
-		Throwable exception = null;
-		try {
-			pool.shutdown();
-			// Comment out for debugging
-			pool.awaitTermination(30, TimeUnit.SECONDS);
-			for (UrlProcessAction action : allActions) {
-				if (!action.isDone()) {
-					tookTooLong = true;
-				} else {
-					Throwable t = action.getException();
-					if (t != null) {
-						if (exception == null) {
-							exception = t;
-						} else {
-							exception.addSuppressed(t);
-						}
-					}
-				}
-			}
-		} catch (InterruptedException e) {
-			throw new ModResolutionException("Mod resolution took too long!", e);
-		}
-		if (tookTooLong) {
-			throw new ModResolutionException("Mod resolution took too long!");
-		}
-		if (exception != null) {
-			throw new ModResolutionException("Mod resolution failed!", exception);
-		}
-
-		long time2 = System.currentTimeMillis();
-		Map<String, ModCandidate> result = findCompatibleSet(loader.getLogger(), candidatesById);
-
-		long time3 = System.currentTimeMillis();
-		loader.getLogger().debug("Mod resolution detection time: " + (time2 - time1) + "ms");
-		loader.getLogger().debug("Mod resolution time: " + (time3 - time2) + "ms");
-
-		for (ModCandidate candidate : result.values()) {
-			if (candidate.getInfo().getSchemaVersion() < ModMetadataParser.LATEST_VERSION) {
-				loader.getLogger().warn("Mod ID " + candidate.getInfo().getId() + " uses outdated schema version: " + candidate.getInfo().getSchemaVersion() + " < " + ModMetadataParser.LATEST_VERSION);
-			}
-
-			candidate.getInfo().emitFormatWarnings(loader.getLogger());
-		}
-
-		return result;
-	}
-
-	private void addBuiltinMod(ConcurrentMap<String, ModCandidateSet> candidatesById, BuiltinMod mod) {
-		candidatesById.computeIfAbsent(mod.metadata.getId(), ModCandidateSet::new)
-				.add(new ModCandidate(new BuiltinMetadataWrapper(mod.metadata), mod.url, 0, false));
-	}
-
-	public static FileSystem getInMemoryFs() {
-		return inMemoryFs;
 	}
 }
